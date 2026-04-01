@@ -1,0 +1,202 @@
+'''
+
+'''
+
+# import multiprocessing
+# multiprocessing.set_start_method('spawn', force=True)
+import bnpy
+import sys
+import json
+import os
+import torch.utils.data
+import numpy as np
+import torchvision.transforms
+from PIL import Image, ImageDraw # ImageDraw 用于绘图
+from loguru import logger
+import math
+import pickle
+from torch.utils.data import Dataset, DataLoader
+import yaml
+import random
+
+# 获取当前脚本的上两级目录（LIBERO/my_code）
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(current_dir)  # parent_dir=my_code
+sys.path.append(parent_dir)
+from my_dpmm_model import BNPModel
+
+from utils import weighted_kl_divergence, collect_samples_for_tsne, collect_samples_for_tsne_v2, visualize_tsne, \
+plot_losses, reset_optimizer, convert_tensor_to_list, purge_invalid_values, cluster_and_evaluate, collect_samples_for_cluster_eval, print_data_info, \
+combine_skill_dataloaders
+import torch.optim as optim
+
+from datetime import datetime
+
+from libero_dataset import LiberoTaskDataset
+from task_encoder import TaskEncoder
+from weighted_kl_div import compute_weighted_kl_loss, compute_soft_labels
+
+
+def train_dpmm(dpmm, config, skill_dataloaders):
+    """dpmm学习主训练循环"""
+    print(f"Starting dpmm learning at {datetime.now()}")
+
+    # used_dataloaders = []
+    skill_id = 0
+
+    for skill, dataloaders in skill_dataloaders.items():
+        # print(f"\n{'*' * 50}")
+        print(f"\n{'*' * 15} Training Skill {skill} {'*' * 15} ")
+        # print(f"{'*' * 50}")
+
+        # 遍历所有任务
+        for task_id, dataloader in enumerate(dataloaders):
+            # print(f"\n{'=' * 50}")
+            # print(f"Training Task {task_id+1}/{len(dataloaders)}: {dataloader.dataset.scen_name}")
+            # print(f"{'=' * 50}")
+
+            # update dpmm every how many batches
+            dpmm_update_freq = len(dataloader)//config['dpmm_update_per_epoch']
+
+            # 2. 训练当前任务
+            for epoch in range(config["epochs_per_task"]):
+                print(f"\nEpoch {epoch + 1}/{config['epochs_per_task']}")
+                current_f_traj_list = []
+                # current_speed_list = []
+                # 3. 遍历批次数据
+                for batch_idx, batch in enumerate(dataloader):
+                    batch = {k: v.cuda() if torch.is_tensor(v) else v for k, v in batch.items()}
+                    # # print(f'shape of flatten traj: {batch["flatten_trajectory_points"].detach().shape}')
+                    batch_size = batch['route'].size(0)
+                    # # print(f'route shape: {batch["route"][:, :10, :].shape}')
+                    # flatten_route = batch['route'][:, :10, :].detach().reshape(batch_size, -1)  # here we use totai 20 checkpoints, not 10.
+                    # # print(f'flatten_route shape: {flatten_route.shape}')
+                    target_speed = batch['target_speed_twohot'].detach()
+                    # # print_data_info(target_speed)
+                    # route_and_speed = torch.concat((flatten_route,target_speed), dim=1)
+                    # print_data_info(route_and_speed)
+                    # waypoint = batch['ego_waypoints']
+                    # print_data_info(waypoint)
+                    # print(f'waypoint = \n{waypoint}')
+                    # flatten_waypoint = batch['ego_waypoints'].detach().reshape(batch_size, -1)  # set self.use_wp_gru = True in config
+                    # print_data_info(flatten_waypoint)
+                    current_f_traj_list.append(target_speed)
+                    if (batch_idx + 1) % dpmm_update_freq == 0:
+                        print(f"Updating DPMM at iteration {batch_idx}...")
+                        if task_id > 0 or skill_id > 0:
+                            K = len(dpmm.components)
+                            new_task_data_ratio = 1 / (1+K) 
+                            # num_to_sample = int((1 - config['new_task_data_ratio']) * len(current_f_traj_list) / config['new_task_data_ratio'])
+                            num_to_sample = int((1 - new_task_data_ratio) * len(current_f_traj_list) / new_task_data_ratio)
+                            print(f'num_to_sample: {num_to_sample }')
+                            # 合并历史z
+                            z_samples = torch.cat((dpmm.sample_all(num_samples=num_to_sample), torch.cat(current_f_traj_list, dim=0)), dim=0)
+                        else:
+                            z_samples = torch.cat(current_f_traj_list, dim=0)
+                        # print(f'z_samples shape: {z_samples.shape}')
+                        z_samples = purge_invalid_values(z_samples, "z_samples")
+                        dpmm.fit(z_samples)
+                        current_f_traj_list = []
+                        
+                        #track dpmm clusters
+                        tracked_clusters = sorted([{'cluster_id': data['id'],'mu': data['mu'],'var': data['var']} for data in dpmm.current_clusters.values()], key=lambda x: x['cluster_id'])
+                        tracked_clusters = convert_tensor_to_list(tracked_clusters)
+                        tracked_clusters_path = os.path.join('../dpmm_results/'+exp_time+'/track_cluster_log', str(skill_id)+'-'+str(task_id)+'-'+str(epoch)+'-'+str(batch_idx)+"-tracked_clusters.json")
+                        with open(tracked_clusters_path, 'w') as f:
+                            json.dump(tracked_clusters, f, indent=4)
+                        print(f"Saved tracked_cluster to {tracked_clusters_path}")
+                        components = sorted(dpmm.components, key = lambda x: x['k'])
+                        components_path = os.path.join('../dpmm_results/'+exp_time+'/component_log', str(skill_id)+'-'+str(task_id)+'-'+str(epoch)+'-'+str(batch_idx)+"-components.json")
+                        with open(components_path, 'w') as f:
+                            json.dump(components, f, indent=4)
+                        print(f"Saved component to {components_path}")
+
+            # 12. 任务完成后可视化
+            # used_dataloaders.append(dataloader)
+            # print(f"Generating t-SNE visualization for task {task_id}...")
+            # tsne_z_samples, tsne_scen_labels = collect_samples_for_tsne(model, used_dataloaders, device)
+            # tsne_z_samples, tsne_scen_labels = collect_samples_for_tsne_v2(used_dataloaders, device)
+            # visualize_tsne(tsne_z_samples, tsne_scen_labels, used_dataloaders, '../dpmm_results/'+exp_time+'/cluster_fig')
+
+            # eval cluster 
+            # X, _ = collect_samples_for_cluster_eval(used_dataloaders, num_per_dataloader=100)
+            # _ = cluster_and_evaluate(X, dpmm, os.path.join('./dpmm_results',exp_time,'eval_cluster',f'{task_id}th_clustering_dpmm_results.json'))
+        # dpmm.save_model(os.path.join(dpmm_save_dir, str(skill_id)))
+        skill_id = skill_id +1
+
+    print(f"dpmm learning completed at {datetime.now()}")
+    dpmm.save_model(dpmm_save_dir)
+
+
+def worker_init_fn(worker_id):
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
+if __name__ == '__main__':
+    exp_time = datetime.now().strftime("%Y-%m-%d-%H-%M")
+    print(f'exp start at {exp_time}')
+
+    # 获取当前脚本所在目录
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    print("Current Working Directory:", os.getcwd())
+    dpmm_save_dir = os.path.join(script_dir, '../dpmm_results', exp_time, 'dpmm_model')
+
+    dataloaders = []
+    task_ids = (0,1,2)  # the tasks to train from LIBERO-10
+    for task_idx, task_id in enumerate(task_ids):
+        dataset = LiberoTaskDataset(
+            task_id=task_id,
+            benchmark_name="libero_10",
+            obs_keys=[],
+            extra_keys=["robot_states"],
+            image_size=(128, 128),
+            return_next_state=True
+        )
+        
+        dataloader = DataLoader(
+            dataset,
+            batch_size=4,
+            shuffle=True,
+            num_workers=4,
+            drop_last=True
+        )
+
+        dataloaders.append(dataloader)
+        
+        print(f"📦 Task {task_id}: {len(dataset)} samples, language: '{dataset.language}'")
+
+    print(f'Loads len({len(dataloader)}) datasets')
+
+    # 初始化参数配置
+    dpmm_config = {
+        # "dpmm_update_freq": 10,  # DPMM更新间隔
+        # "dpmm_update_every_epoch": True,  # DPMM更新间隔
+        "dpmm_update_per_epoch": 3,  # DPMM更新间隔
+        "epochs_per_task": 1,  # 每个任务训练轮数 5 may be enough
+        # "batch_size": 16,  # 批次大小
+        # "learning_rate": 1e-4,  # 学习率
+        "latent_dim": 10,  # 潜在空间维度
+        "save_dir": "../dpmm_results",  # 保存路径
+        "gamma0": 5,  # DPMM初始参数
+        "num_lap": 1000,
+        "sF": 1e-5,
+        # "new_task_data_ratio": 0.5,
+    }
+    # 创建保存目录（如果不存在）
+    os.makedirs('../dpmm_results/'+exp_time, exist_ok=True)
+    os.makedirs('../dpmm_results/'+exp_time+'/component_log', exist_ok=True)
+    os.makedirs('../dpmm_results/'+exp_time+'/track_cluster_log', exist_ok=True)
+    os.makedirs('../dpmm_results/'+exp_time+'/ckpt', exist_ok=True)
+    # os.makedirs(os.path.join('./dpmm_results',exp_time,'eval_clustering'), exist_ok=True)
+    # 保存 config 到 JSON 文件
+    dpmm_config_path = os.path.join('../dpmm_results/'+exp_time, "config.json")
+    with open(dpmm_config_path, 'w') as f:
+        json.dump(dpmm_config, f, indent=4)
+    print(f"Saved config to {dpmm_config_path}")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dpmm = BNPModel(save_dir=dpmm_save_dir, gamma0=dpmm_config["gamma0"], num_lap=dpmm_config["num_lap"], sF=dpmm_config["sF"])  # DPMM模型
+
+    # train_dpmm(dpmm, dpmm_config, dataloaders)

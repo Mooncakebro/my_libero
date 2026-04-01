@@ -9,6 +9,9 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from libero_dataset import LiberoTaskDataset  # Your provided dataset
 from task_encoder import TaskEncoder
+from torch.utils.tensorboard import SummaryWriter  
+import time  
+from datetime import datetime
 
 
 def train_task_encoder(
@@ -32,6 +35,11 @@ def train_task_encoder(
         robot_state_dim=9,
         action_dim=7
     ).to(device)
+
+    # Create a unique log directory based on task_id and timestamp
+    log_dir = f"../runs/task_encoder_task{task_id}_" + datetime.now().strftime("%Y-%m-%d-%H-%M")
+    writer = SummaryWriter(log_dir=log_dir)
+    print(f"📊 TensorBoard logs saved to: {log_dir}")
     
     # Optimizer: only trainable params (CLIP is frozen)
     trainable_params = [p for p in model.parameters() if p.requires_grad]
@@ -106,13 +114,25 @@ def train_task_encoder(
             epoch_losses.append(loss_dict['total'])
             
             # Logging
-            if batch_idx % 50 == 0:
+            if batch_idx % 200 == 0:
                 print(f"  Epoch {epoch+1}/{epochs} | Batch {batch_idx} | "
                       f"Loss: {loss_dict['total']:.4f} "
                       f"(recon:{loss_dict['recon']:.3f}, "
                       f"kl:{loss_dict['kl']:.3f}, "
                       f"wkl:{loss_dict['wkl']:.3f}, "
                       f"dyn:{loss_dict['dynamics']:.3f})")
+
+                global_step = epoch * len(dataloader) + batch_idx
+            
+                # Log individual loss components
+                writer.add_scalar('Loss/Total', loss_dict['total'], global_step)
+                writer.add_scalar('Loss/Recon', loss_dict['recon'], global_step)
+                writer.add_scalar('Loss/Dynamics', loss_dict['dynamics'], global_step)
+                writer.add_scalar('Loss/KL', loss_dict['kl'], global_step)
+                writer.add_scalar('Loss/WKL', loss_dict['wkl'], global_step)
+                
+                # Log Learning Rate
+                writer.add_scalar('Params/LR', optimizer.param_groups[0]['lr'], global_step)
         
         # Epoch summary
         avg_loss = sum(epoch_losses) / len(epoch_losses)
@@ -121,11 +141,12 @@ def train_task_encoder(
         # Save best model
         if avg_loss < best_loss:
             best_loss = avg_loss
-            save_path = f"task_encoder_task{task_id}_best.pt"
+            save_path = f"../ckpts/results/task_encoder_task{task_id}.pt"
             torch.save(model.state_dict(), save_path)
             print(f"  💾 Saved best model to {save_path}")
     
     print("🎉 Training finished!")
+    writer.close()
     return model
 
 if __name__ == "__main__":
@@ -134,7 +155,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--mode', type=str, default='train', choices=['train', 'inference'])
     parser.add_argument('--task_id', type=int, default=9)
-    parser.add_argument('--model_path', type=str, default='../ckpts/results/task_encoder_task9_best.pt')
     args = parser.parse_args()
     
     train_task_encoder(task_id=args.task_id)

@@ -279,7 +279,7 @@ class TaskEncoder(nn.Module):
             'total': total_loss.item(),
             'recon': recon_loss.item(),
             'kl': kl_loss.item(),
-            'wkl': w_kl_loss.item(),
+            'wkl': w_kl_loss,
             'dynamics': dynamics_loss.item()
         }
         
