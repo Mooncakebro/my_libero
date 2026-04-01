@@ -16,3 +16,10 @@ logs/
 *.mp4
 libero.egg-info/
 .vscode/
+
+*.jpg
+*.png
+*.pt
+*.zip
+ckpts/
+bnpy/
