@@ -1,4 +1,14 @@
 import os
+import sys
+
+# Ensure we import the real bnpy package from LIBERO/bnpy/bnpy, not the
+# namespace package at LIBERO/bnpy that can appear after editable installs.
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.dirname(_THIS_DIR)
+_BNPY_REPO_ROOT = os.path.join(_PROJECT_ROOT, "bnpy")
+if os.path.isdir(_BNPY_REPO_ROOT) and _BNPY_REPO_ROOT not in sys.path:
+    sys.path.insert(0, _BNPY_REPO_ROOT)
+
 import bnpy
 # from ...bnpy.bnpy.ioutil.ModelReader import load_model_at_prefix
 # from bnpy import load_model_at_prefix
@@ -623,7 +633,6 @@ class BNPModel:
         
         # Base types pass through
         return obj
-
 
 
 

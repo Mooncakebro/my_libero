@@ -215,7 +215,7 @@ class TaskEncoder(nn.Module):
             'next_state_pred': next_state_pred,      # (B, 9)
         }
 
-    # ========== Weighted KL Div Loss Computation ==========
+    # ========== Weighted KL Div Loss Computation ==========  # we use another script to deal with it
     def _compute_weighted_kl_div(self):
         return 0
 
